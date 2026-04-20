@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Taste Flow - 声音调味节点流</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="stage" id="workspace">
+      <svg class="edge-layer" id="edgeLayer"></svg>
+
+      <aside class="sidebar" id="sidebar">
+        <h2>节点组件栏</h2>
+        <button id="nodeMenuToggle" class="tool-btn" type="button" aria-expanded="false">参数节点组件</button>
+        <section class="node-menu is-hidden" id="nodeMenu" aria-hidden="true">
+          <h3>参数处理节点组件</h3>
+          <div class="node-grid">
+            <article class="node-card node-template" data-node-type="adsr"><span>ADSR</span></article>
+            <article class="node-card node-template" data-node-type="compression"><span>动态挤压</span></article>
+            <article class="node-card node-template" data-node-type="drywet"><span>干湿比</span></article>
+            <article class="node-card node-template" data-node-type="reverb"><span>混响</span></article>
+            <article class="node-card node-template" data-node-type="distortion"><span>波形畸变</span></article>
+            <article class="node-card node-template" data-node-type="frequency"><span>频率 Peak</span></article>
+            <article class="node-card node-template" data-node-type="lpf"><span>低通滤波</span></article>
+            <article class="node-card node-template" data-node-type="centroid"><span>频谱重心</span></article>
+            <article class="node-card node-template" data-node-type="phase"><span>相位移动</span></article>
+            <article class="node-card node-template" data-node-type="hpf"><span>高通滤波</span></article>
+            <article class="node-card node-template" data-node-type="grain"><span>时间切片</span></article>
+          </div>
+        </section>
+
+        <button id="presetMenuToggle" class="tool-btn" type="button" aria-expanded="false">预设节点组件</button>
+        <section class="preset-menu is-hidden" id="presetMenu" aria-hidden="true">
+          <h3>预设效果</h3>
+          <div class="preset-group">
+            <button class="preset-item" data-preset="fry"><i class="port green p-top" data-port="preset-fry" data-color="green"></i>油炸</button>
+            <button class="preset-item" data-preset="boil"><i class="port green p-top" data-port="preset-boil" data-color="green"></i>水煮</button>
+            <button class="preset-item" data-preset="grill"><i class="port green p-top" data-port="preset-grill" data-color="green"></i>炙烤</button>
+            <button class="preset-item" data-preset="steam"><i class="port green p-top" data-port="preset-steam" data-color="green"></i>清蒸</button>
+          </div>
+          <div class="preset-group short">
+            <button class="preset-item" data-preset="hot"><i class="port yellow p-top" data-port="preset-hot" data-color="yellow"></i>高温</button>
+            <button class="preset-item" data-preset="cold"><i class="port yellow p-top" data-port="preset-cold" data-color="yellow"></i>低温</button>
+          </div>
+          <div class="preset-group">
+            <button class="preset-item" data-preset="acid"><i class="port pink p-top" data-port="preset-acid" data-color="pink"></i>酸</button>
+            <button class="preset-item" data-preset="sweet"><i class="port pink p-top" data-port="preset-sweet" data-color="pink"></i>甜</button>
+            <button class="preset-item" data-preset="bitter"><i class="port pink p-top" data-port="preset-bitter" data-color="pink"></i>苦</button>
+            <button class="preset-item" data-preset="spicy"><i class="port pink p-top" data-port="preset-spicy" data-color="pink"></i>辣</button>
+            <button class="preset-item" data-preset="grainy"><i class="port pink p-top" data-port="preset-grainy" data-color="pink"></i>颗粒度</button>
+          </div>
+          <div class="preset-group short">
+            <button class="preset-item" data-preset="flash"><i class="port blue p-top" data-port="preset-flash" data-color="blue"></i>猛火</button>
+            <button class="preset-item" data-preset="slow"><i class="port blue p-top" data-port="preset-slow" data-color="blue"></i>文火</button>
+            <button class="preset-item" data-preset="maillard"><i class="port blue p-top" data-port="preset-maillard" data-color="blue"></i>焦化</button>
+          </div>
+        </section>
+
+        <p class="drag-tip">按住空格 + 拖动画布背景</p>
+      </aside>
+
+      <div class="world" id="world">
+        <div class="panel-layer" id="panelLayer"></div>
+        <section class="center-zone">
+          <article class="system-bubble bubble-blue">
+            <span>火候控制</span>
+            <button class="port blue p-top" data-port="fire-main" data-color="blue" data-node-kind="system"></button>
+            <button class="port blue p-left" data-port="fire-side" data-color="blue" data-node-kind="system"></button>
+          </article>
+          <article class="system-bubble bubble-pink">
+            <span>调味</span>
+            <button class="port pink p-top" data-port="seasoning-main" data-color="pink" data-node-kind="system"></button>
+            <button class="port pink p-right" data-port="seasoning-side" data-color="pink" data-node-kind="system"></button>
+          </article>
+          <article class="system-bubble bubble-green">
+            <span>烹饪方式</span>
+            <button class="port green p-left" data-port="cooking-main" data-color="green" data-node-kind="system"></button>
+            <button class="port green p-bottom" data-port="cooking-side" data-color="green" data-node-kind="system"></button>
+          </article>
+          <article class="system-bubble bubble-yellow">
+            <span>调温</span>
+            <button class="port yellow p-right" data-port="temperature-main" data-color="yellow" data-node-kind="system"></button>
+            <button class="port yellow p-bottom" data-port="temperature-side" data-color="yellow" data-node-kind="system"></button>
+          </article>
+
+          <div class="audio-node" id="audioNode">
+            <button class="audio-hub" id="audioHub" type="button" title="点击选择音频并播放">
+              <span class="play-icon" id="playIcon">▶</span>
+            </button>
+            <button class="audio-picker-btn" id="audioPickerBtn" type="button">选择音频</button>
+            <button class="port hub-port blue hub-top" data-port="audio-blue" data-color="blue" data-node-kind="audio"></button>
+            <button class="port hub-port pink hub-right" data-port="audio-pink" data-color="pink" data-node-kind="audio"></button>
+            <button class="port hub-port green hub-left" data-port="audio-green" data-color="green" data-node-kind="audio"></button>
+            <button class="port hub-port yellow hub-bottom" data-port="audio-yellow" data-color="yellow" data-node-kind="audio"></button>
+            <p class="audio-label" id="hubLabel">未选择音频</p>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <dialog id="audioDialog">
+      <form method="dialog" class="audio-form">
+        <h3>选择音频素材</h3>
+        <label>
+          音频列表
+          <select id="audioSelect"></select>
+        </label>
+        <menu>
+          <button value="cancel">取消</button>
+          <button id="confirmAudio" value="default">使用该音频</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <audio id="player" preload="metadata"></audio>
+    <script src="./script.js"></script>
+  </body>
+</html>
