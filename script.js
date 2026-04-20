@@ -1,4 +1,3 @@
-const audioFiles = ["A.mp3", "B.mp3", "C.mp3", "D.mp3", "E.mp3", "F.mp3", "G.mp3", "H.mp3", "I.mp3", "J.mp3", "K.mp3", "L.mp3"];
 const PANEL_W = 386;
 const PANEL_H = 276;
 
@@ -30,8 +29,8 @@ const NODE_DEFS = {
   adsr: {
     title: "ADSR",
     colors: ["blue"],
-    audioParam: "AudioParam.linearRampToValueAtTime",
-    physics: "顶点 X 为时间，Y 为振幅，直接定义包络轨迹。",
+    audioParam: "BiquadFilterNode.frequency（相对 1.0 / 峰值 1.2）",
+    physics: "横轴总长=合成时间窗（10s）；仅拖 X 定 A/D/S 分界；A 顶 ×1.2 频、S 段原频；不调音量；新一次按键发声时生效。",
   },
   distortion: {
     title: "波形畸变",
@@ -80,17 +79,10 @@ const nodeMenu = document.getElementById("nodeMenu");
 const nodeMenuToggle = document.getElementById("nodeMenuToggle");
 const presetMenu = document.getElementById("presetMenu");
 const presetMenuToggle = document.getElementById("presetMenuToggle");
-const audioNode = document.getElementById("audioNode");
-const audioHub = document.getElementById("audioHub");
-const audioPickerBtn = document.getElementById("audioPickerBtn");
-const audioDialog = document.getElementById("audioDialog");
-const audioSelect = document.getElementById("audioSelect");
-const confirmAudio = document.getElementById("confirmAudio");
-const playIcon = document.getElementById("playIcon");
-const hubLabel = document.getElementById("hubLabel");
-const player = document.getElementById("player");
+const pianoRig = document.getElementById("pianoRig");
+const pianoKeys = document.getElementById("pianoKeys");
+const pianoDragHandle = document.getElementById("pianoDragHandle");
 
-let selectedAudio = "";
 let panelCounter = 1;
 let edges = [];
 
@@ -116,12 +108,296 @@ const colorMap = {
 const edgeKey = (a, b, c) => `${a}|${b}|${c}`;
 const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
 
-function buildAudioOptions() {
-  audioFiles.forEach((name) => {
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = name;
-    audioSelect.appendChild(opt);
+/** 本地上传音频仅允许连续播放的最长时间（秒），从当前片段起点计。 */
+const MAX_LOCAL_PLAYBACK_SEC = 10;
+
+/** ADSR 频率调制：相对中心频率的倍数（A 顶 1.2，S 段 1.0），不调增益。 */
+const ADSR_FREQ_BASE_HZ = 2600;
+const ADSR_FREQ_PEAK = 1.2;
+const ADSR_FREQ_SUSTAIN = 1;
+
+let audioCtx = null;
+let masterGainNode = null;
+let adsrFilterNode = null;
+/** 有琴键按下时使用的 ADSR 时间快照（秒），新一次发声开始时更新 */
+let adsrPlaySnapshot = null;
+let synthSessionStart = 0;
+let adsrRafId = 0;
+const pianoVoices = new Map();
+const pianoKeyButtons = new Map();
+const computerPianoCodes = new Set();
+/** 与 ADSR 面板同步的横向像素；横轴总时长 = 可播放窗口（与 MAX_LOCAL_PLAYBACK_SEC 一致） */
+let adsrTimeAxisPx = { x0: 20, xR: 360, xa: 90, xd: 150, xu: 260 };
+
+/** ADSR 横轴总秒数：与合成时间窗一致（当前 10s），对应当前钢琴 ADSR 调制周期 */
+function getAdsrTimelineDurationSec() {
+  return MAX_LOCAL_PLAYBACK_SEC;
+}
+
+function syncAdsrTimeAxisPxFromShape(p) {
+  adsrTimeAxisPx = { x0: p.s.x, xR: p.r.x, xa: p.a.x, xd: p.d.x, xu: p.u.x };
+}
+
+function buildAdsrSnapshot() {
+  const D = getAdsrTimelineDurationSec();
+  const { x0, xR, xa, xd, xu } = adsrTimeAxisPx;
+  const span = Math.max(xR - x0, 1e-6);
+  let tA = ((xa - x0) / span) * D;
+  let tD = ((xd - x0) / span) * D;
+  let tU = ((xu - x0) / span) * D;
+  tA = clamp(tA, 0, D);
+  tD = clamp(Math.max(tA, tD), 0, D);
+  tU = clamp(Math.max(tD, tU), 0, D);
+  return { D, tA, tD, tU };
+}
+
+function adsrFreqMultiplierAt(t, snap) {
+  if (!snap) return ADSR_FREQ_SUSTAIN;
+  const { D, tA, tD, tU } = snap;
+  const tc = clamp(t, 0, D);
+  if (tc <= tA) {
+    const w = tA > 1e-6 ? tc / tA : 1;
+    return ADSR_FREQ_SUSTAIN + (ADSR_FREQ_PEAK - ADSR_FREQ_SUSTAIN) * w;
+  }
+  if (tc <= tD) {
+    const w = tD > tA + 1e-6 ? (tc - tA) / (tD - tA) : 1;
+    return ADSR_FREQ_PEAK + (ADSR_FREQ_SUSTAIN - ADSR_FREQ_PEAK) * w;
+  }
+  if (tc <= tU) return ADSR_FREQ_SUSTAIN;
+  return ADSR_FREQ_SUSTAIN;
+}
+
+let mainAudioChainWired = false;
+
+function ensureAudioGraph() {
+  if (audioCtx && masterGainNode && adsrFilterNode) return true;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return false;
+    if (!audioCtx) audioCtx = new Ctx();
+    if (!masterGainNode) {
+      masterGainNode = audioCtx.createGain();
+      masterGainNode.gain.value = 0.18;
+    }
+    if (!adsrFilterNode) {
+      adsrFilterNode = audioCtx.createBiquadFilter();
+      adsrFilterNode.type = "peaking";
+      adsrFilterNode.frequency.value = ADSR_FREQ_BASE_HZ * ADSR_FREQ_SUSTAIN;
+      adsrFilterNode.Q.value = 1.1;
+      adsrFilterNode.gain.value = 4;
+    }
+    if (!mainAudioChainWired) {
+      masterGainNode.connect(adsrFilterNode);
+      adsrFilterNode.connect(audioCtx.destination);
+      mainAudioChainWired = true;
+    }
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+function getSynthTimelineSec() {
+  if (!audioCtx) return 0;
+  const elapsed = audioCtx.currentTime - synthSessionStart;
+  const mod = elapsed % MAX_LOCAL_PLAYBACK_SEC;
+  return mod < 0 ? 0 : mod;
+}
+
+function applyAdsrFilterFromSynthClock() {
+  if (!audioCtx || !adsrFilterNode || !adsrPlaySnapshot || pianoVoices.size === 0) return;
+  const t = getSynthTimelineSec();
+  const m = adsrFreqMultiplierAt(t, adsrPlaySnapshot);
+  adsrFilterNode.frequency.setTargetAtTime(ADSR_FREQ_BASE_HZ * m, audioCtx.currentTime, 0.02);
+}
+
+function stopAdsrRafLoop() {
+  if (adsrRafId) cancelAnimationFrame(adsrRafId);
+  adsrRafId = 0;
+}
+
+function adsrRafLoop() {
+  applyAdsrFilterFromSynthClock();
+  if (pianoVoices.size > 0) {
+    adsrRafId = requestAnimationFrame(adsrRafLoop);
+  } else {
+    adsrRafId = 0;
+    if (audioCtx && adsrFilterNode) {
+      adsrFilterNode.frequency.setTargetAtTime(ADSR_FREQ_BASE_HZ * ADSR_FREQ_SUSTAIN, audioCtx.currentTime, 0.06);
+    }
+  }
+}
+
+function startAdsrRafLoop() {
+  if (adsrRafId) return;
+  adsrRafId = requestAnimationFrame(adsrRafLoop);
+}
+
+function midiToHz(midi) {
+  return 440 * 2 ** ((midi - 69) / 12);
+}
+
+const KEYBOARD_TO_MIDI = {
+  KeyZ: 60,
+  KeyS: 61,
+  KeyX: 62,
+  KeyD: 63,
+  KeyC: 64,
+  KeyV: 65,
+  KeyG: 66,
+  KeyB: 67,
+  KeyH: 68,
+  KeyN: 69,
+  KeyJ: 70,
+  KeyM: 71,
+  Comma: 72,
+};
+
+const PIANO_NOTE_LABELS = { 60: "C", 61: "C#", 62: "D", 63: "D#", 64: "E", 65: "F", 66: "F#", 67: "G", 68: "G#", 69: "A", 70: "A#", 71: "B", 72: "C" };
+const PIANO_WHITE_MIDI = [60, 62, 64, 65, 67, 69, 71, 72];
+const PIANO_BLACK_SPECS = [
+  { midi: 61, afterWhiteIndex: 0 },
+  { midi: 63, afterWhiteIndex: 1 },
+  { midi: 66, afterWhiteIndex: 3 },
+  { midi: 68, afterWhiteIndex: 4 },
+  { midi: 70, afterWhiteIndex: 5 },
+];
+const PIANO_WHITE_W = 44;
+const PIANO_KEY_GAP = 3;
+const PIANO_BLACK_W = 24;
+
+function wirePianoKeyButton(btn, midi) {
+  btn.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    try {
+      btn.setPointerCapture(e.pointerId);
+    } catch (_err) {}
+    btn.classList.add("is-down");
+    pianoNoteOn(midi);
+  });
+  btn.addEventListener("pointerup", (e) => {
+    btn.classList.remove("is-down");
+    try {
+      if (btn.hasPointerCapture(e.pointerId)) btn.releasePointerCapture(e.pointerId);
+    } catch (_err) {}
+    pianoNoteOff(midi);
+  });
+  btn.addEventListener("pointercancel", () => {
+    btn.classList.remove("is-down");
+    pianoNoteOff(midi);
+  });
+}
+
+function pianoNoteOn(midi) {
+  if (!ensureAudioGraph() || !audioCtx || !masterGainNode) return;
+  if (pianoVoices.has(midi)) return;
+  const wasEmpty = pianoVoices.size === 0;
+  const t0 = audioCtx.currentTime;
+  if (wasEmpty) {
+    adsrPlaySnapshot = buildAdsrSnapshot();
+    synthSessionStart = t0;
+    startAdsrRafLoop();
+  }
+  void audioCtx.resume();
+
+  const osc = audioCtx.createOscillator();
+  osc.type = "triangle";
+  osc.frequency.setValueAtTime(midiToHz(midi), t0);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(0.16, t0 + 0.02);
+  osc.connect(g);
+  g.connect(masterGainNode);
+  osc.start(t0);
+  pianoVoices.set(midi, { osc, gainNode: g });
+}
+
+function pianoNoteOff(midi) {
+  const v = pianoVoices.get(midi);
+  if (!v || !audioCtx) return;
+  const t = audioCtx.currentTime;
+  const { osc, gainNode: g } = v;
+  g.gain.cancelScheduledValues(t);
+  g.gain.setValueAtTime(Math.max(g.gain.value, 0.0001), t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
+  try {
+    osc.stop(t + 0.13);
+  } catch (_e) {}
+  pianoVoices.delete(midi);
+  if (pianoVoices.size === 0) stopAdsrRafLoop();
+}
+
+function buildPianoKeys() {
+  if (!pianoKeys) return;
+  pianoKeyButtons.clear();
+  pianoKeys.innerHTML = "";
+  const whitesWrap = document.createElement("div");
+  whitesWrap.className = "piano-keys__whites";
+  const totalW = PIANO_WHITE_MIDI.length * PIANO_WHITE_W + (PIANO_WHITE_MIDI.length - 1) * PIANO_KEY_GAP;
+  pianoKeys.style.width = `${totalW}px`;
+
+  PIANO_WHITE_MIDI.forEach((midi) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "piano-key piano-key--white";
+    btn.dataset.midi = String(midi);
+    btn.textContent = PIANO_NOTE_LABELS[midi] || "";
+    wirePianoKeyButton(btn, midi);
+    whitesWrap.appendChild(btn);
+    pianoKeyButtons.set(midi, btn);
+  });
+  pianoKeys.appendChild(whitesWrap);
+
+  PIANO_BLACK_SPECS.forEach(({ midi, afterWhiteIndex }) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "piano-key piano-key--black";
+    btn.dataset.midi = String(midi);
+    btn.textContent = PIANO_NOTE_LABELS[midi] || "";
+    const left = afterWhiteIndex * (PIANO_WHITE_W + PIANO_KEY_GAP) + PIANO_WHITE_W - PIANO_BLACK_W / 2;
+    btn.style.left = `${left}px`;
+    wirePianoKeyButton(btn, midi);
+    pianoKeys.appendChild(btn);
+    pianoKeyButtons.set(midi, btn);
+  });
+}
+
+function wirePiano() {
+  buildPianoKeys();
+
+  window.addEventListener("keydown", (e) => {
+    if (e.repeat) return;
+    if (e.target.closest("input, textarea, select")) return;
+    if (e.target.closest(".sidebar")) return;
+    const midi = KEYBOARD_TO_MIDI[e.code];
+    if (midi == null) return;
+    e.preventDefault();
+    if (computerPianoCodes.has(e.code)) return;
+    computerPianoCodes.add(e.code);
+    const btn = pianoKeyButtons.get(midi);
+    if (btn) btn.classList.add("is-down");
+    pianoNoteOn(midi);
+  });
+
+  window.addEventListener("keyup", (e) => {
+    const midi = KEYBOARD_TO_MIDI[e.code];
+    if (midi == null) return;
+    if (e.target.closest(".sidebar")) return;
+    computerPianoCodes.delete(e.code);
+    const btn = pianoKeyButtons.get(midi);
+    if (btn) btn.classList.remove("is-down");
+    pianoNoteOff(midi);
+  });
+
+  window.addEventListener("blur", () => {
+    [...computerPianoCodes].forEach((code) => {
+      const midi = KEYBOARD_TO_MIDI[code];
+      if (midi != null) {
+        pianoKeyButtons.get(midi)?.classList.remove("is-down");
+        pianoNoteOff(midi);
+      }
+      computerPianoCodes.delete(code);
+    });
   });
 }
 
@@ -322,19 +598,40 @@ function addPanelPorts(panel, colors, prefix) {
 function initAdsr(host, valueEl) {
   const svg = createSvg(386, 170);
   host.appendChild(svg);
+  const Y_BASE = 150;
+  const Y_PEAK = 24;
+  const Y_SUST = 76;
   const p = {
-    s: { x: 20, y: 150 },
-    a: { x: 98, y: 24 },
-    d: { x: 154, y: 76 },
-    u: { x: 266, y: 76 },
-    r: { x: 336, y: 150 },
+    s: { x: 20, y: Y_BASE },
+    a: { x: 90, y: Y_PEAK },
+    d: { x: 150, y: Y_SUST },
+    u: { x: 260, y: Y_SUST },
+    r: { x: 360, y: Y_BASE },
   };
+  const axis = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  axis.setAttribute("x1", String(p.s.x));
+  axis.setAttribute("y1", String(Y_BASE + 6));
+  axis.setAttribute("x2", String(p.r.x));
+  axis.setAttribute("y2", String(Y_BASE + 6));
+  axis.setAttribute("stroke", "#9aa4b5");
+  axis.setAttribute("stroke-width", "1");
+  axis.setAttribute("stroke-dasharray", "4 4");
+  svg.appendChild(axis);
+  const axisCap = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  axisCap.setAttribute("x", String(p.r.x - 2));
+  axisCap.setAttribute("y", String(Y_BASE + 20));
+  axisCap.setAttribute("text-anchor", "end");
+  axisCap.setAttribute("fill", "#4a5568");
+  axisCap.setAttribute("font-size", "11");
+  axisCap.textContent = `时间 → 0–${MAX_LOCAL_PLAYBACK_SEC}s（可播窗口）`;
+  svg.appendChild(axisCap);
+
   const poly = document.createElementNS("http://www.w3.org/2000/svg", "path");
   poly.setAttribute("fill", "rgba(77,143,255,0.22)");
   poly.setAttribute("stroke", "#2d73d4");
   poly.setAttribute("stroke-width", "2.4");
   svg.appendChild(poly);
-  const keys = ["a", "d", "u", "r"];
+  const keys = ["a", "d", "u"];
   const handles = keys.map((k) => {
     const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
     c.dataset.k = k;
@@ -346,6 +643,11 @@ function initAdsr(host, valueEl) {
   let active = "";
 
   const redraw = () => {
+    p.a.y = Y_PEAK;
+    p.d.y = Y_SUST;
+    p.u.y = Y_SUST;
+    p.s.y = Y_BASE;
+    p.r.y = Y_BASE;
     poly.setAttribute(
       "d",
       `M ${p.s.x} ${p.s.y} L ${p.a.x} ${p.a.y} L ${p.d.x} ${p.d.y} L ${p.u.x} ${p.u.y} L ${p.r.x} ${p.r.y} L ${p.r.x} ${p.s.y} L ${p.s.x} ${p.s.y} Z`,
@@ -354,7 +656,13 @@ function initAdsr(host, valueEl) {
       h.setAttribute("cx", String(p[h.dataset.k].x));
       h.setAttribute("cy", String(p[h.dataset.k].y));
     });
-    valueEl.textContent = `A:${p.a.x - p.s.x} D:${p.d.x - p.a.x} S:${Math.round((150 - p.u.y) / 1.4)} R:${p.r.x - p.u.x}`;
+    syncAdsrTimeAxisPxFromShape(p);
+    const D = getAdsrTimelineDurationSec();
+    const span = Math.max(p.r.x - p.s.x, 1e-6);
+    const tA = ((p.a.x - p.s.x) / span) * D;
+    const tD = ((p.d.x - p.s.x) / span) * D;
+    const tU = ((p.u.x - p.s.x) / span) * D;
+    valueEl.textContent = `共${D}s | A:${tA.toFixed(2)}s D:${(tD - tA).toFixed(2)}s S:${(tU - tD).toFixed(2)}s R:${(D - tU).toFixed(2)}s · 频×${ADSR_FREQ_PEAK}/×${ADSR_FREQ_SUSTAIN} · 下次按键生效`;
   };
   svg.addEventListener("mousedown", (e) => {
     const h = e.target.closest("circle");
@@ -366,21 +674,13 @@ function initAdsr(host, valueEl) {
     if (!active) return;
     const r = svg.getBoundingClientRect();
     const x = e.clientX - r.left;
-    const y = e.clientY - r.top;
+    const gap = 14;
     if (active === "a") {
-      p.a.x = clamp(x, 58, 126);
-      p.a.y = clamp(y, 10, 118);
+      p.a.x = clamp(x, p.s.x + gap, p.d.x - gap);
     } else if (active === "d") {
-      p.d.x = clamp(x, p.a.x + 20, 230);
-      p.d.y = clamp(y, 42, 128);
-      p.u.x = Math.max(p.u.x, p.d.x + 30);
-      p.u.y = p.d.y;
+      p.d.x = clamp(x, p.a.x + gap, p.u.x - gap);
     } else if (active === "u") {
-      p.u.x = clamp(x, p.d.x + 30, 300);
-      p.u.y = clamp(y, 42, 128);
-      p.d.y = p.u.y;
-    } else if (active === "r") {
-      p.r.x = clamp(x, p.u.x + 24, 360);
+      p.u.x = clamp(x, p.d.x + gap, p.r.x - gap);
     }
     redraw();
   });
@@ -872,6 +1172,7 @@ function createNodePanel(type, x, y) {
   const panel = document.createElement("article");
   panel.className = "node-panel";
   panel.dataset.panelId = String(id);
+  panel.dataset.nodeType = type;
   panel.style.left = `${x}px`;
   panel.style.top = `${y}px`;
 
@@ -929,10 +1230,10 @@ function wireTemplateDrag() {
 
 function wireBubbleDrag() {
   const zone = document.querySelector(".center-zone");
-  document.querySelectorAll(".system-bubble, #audioNode").forEach((bubble) => {
+  document.querySelectorAll(".system-bubble").forEach((bubble) => {
     bubble.addEventListener("mousedown", (e) => {
       if (isSpacePressed) return;
-      if (e.target.closest(".port") || e.target.closest(".audio-picker-btn")) return;
+      if (e.target.closest(".port")) return;
       e.preventDefault();
       const zr = zone.getBoundingClientRect();
       const br = bubble.getBoundingClientRect();
@@ -946,6 +1247,23 @@ function wireBubbleDrag() {
       bubble.style.cursor = "grabbing";
     });
   });
+
+  if (pianoRig && pianoDragHandle && zone) {
+    pianoDragHandle.addEventListener("mousedown", (e) => {
+      if (isSpacePressed) return;
+      e.preventDefault();
+      const zr = zone.getBoundingClientRect();
+      const br = pianoRig.getBoundingClientRect();
+      didBubbleDrag = false;
+      bubbleDrag = {
+        bubble: pianoRig,
+        start: { x: e.clientX, y: e.clientY },
+        origin: { left: br.left - zr.left, top: br.top - zr.top },
+      };
+      pianoRig.style.transform = "none";
+      pianoDragHandle.style.cursor = "grabbing";
+    });
+  }
 }
 
 function wirePanelDrag() {
@@ -1028,7 +1346,9 @@ function wireGlobalPointer() {
     }
 
     if (bubbleDrag) {
-      bubbleDrag.bubble.style.cursor = "grab";
+      const hdr = bubbleDrag.bubble.querySelector(".piano-rig__header");
+      if (hdr) hdr.style.cursor = "grab";
+      else bubbleDrag.bubble.style.cursor = "grab";
       bubbleDrag = null;
       return;
     }
@@ -1076,47 +1396,10 @@ function wireCanvasPan() {
   });
 }
 
-function wireAudio() {
-  audioPickerBtn.addEventListener("click", (e) => {
-    e.preventDefault();
-    audioDialog.showModal();
-  });
-
-  audioHub.addEventListener("click", () => {
-    if (didBubbleDrag) {
-      didBubbleDrag = false;
-      return;
-    }
-    if (!selectedAudio) return;
-    if (player.paused) player.play();
-    else player.pause();
-  });
-
-  confirmAudio.addEventListener("click", () => {
-    selectedAudio = audioSelect.value;
-    player.src = `./assets/${selectedAudio}`;
-    player.pause();
-    player.currentTime = 0;
-    hubLabel.textContent = selectedAudio;
-    playIcon.textContent = "▶";
-  });
-
-  player.addEventListener("play", () => {
-    playIcon.textContent = "⏸";
-  });
-  player.addEventListener("pause", () => {
-    playIcon.textContent = "▶";
-  });
-  player.addEventListener("ended", () => {
-    playIcon.textContent = "▶";
-  });
-}
-
 function setupWindowEvents() {
   window.addEventListener("resize", renderEdges);
 }
 
-buildAudioOptions();
 wireMenus();
 decorateTemplateMarkers();
 wireTemplateDrag();
@@ -1124,7 +1407,7 @@ wireBubbleDrag();
 wirePanelDrag();
 wirePortConnect();
 wireGlobalPointer();
-wireAudio();
+wirePiano();
 wireCanvasPan();
 setupWindowEvents();
 centerWorld();

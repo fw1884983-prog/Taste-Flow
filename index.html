@@ -84,36 +84,23 @@
             <button class="port yellow p-bottom" data-port="temperature-side" data-color="yellow" data-node-kind="system"></button>
           </article>
 
-          <div class="audio-node" id="audioNode">
-            <button class="audio-hub" id="audioHub" type="button" title="点击选择音频并播放">
-              <span class="play-icon" id="playIcon">▶</span>
-            </button>
-            <button class="audio-picker-btn" id="audioPickerBtn" type="button">选择音频</button>
-            <button class="port hub-port blue hub-top" data-port="audio-blue" data-color="blue" data-node-kind="audio"></button>
-            <button class="port hub-port pink hub-right" data-port="audio-pink" data-color="pink" data-node-kind="audio"></button>
-            <button class="port hub-port green hub-left" data-port="audio-green" data-color="green" data-node-kind="audio"></button>
-            <button class="port hub-port yellow hub-bottom" data-port="audio-yellow" data-color="yellow" data-node-kind="audio"></button>
-            <p class="audio-label" id="hubLabel">未选择音频</p>
-          </div>
+          <article class="piano-rig" id="pianoRig">
+            <header class="piano-rig__header" id="pianoDragHandle">
+              <span class="piano-rig__title">钢琴</span>
+              <span class="piano-rig__subtitle">拖标题栏移动 · 鼠标 / 触控 / 键盘 Z 行</span>
+            </header>
+            <div class="piano-rig__body">
+              <div class="piano-keys" id="pianoKeys" role="application" aria-label="钢琴键盘"></div>
+            </div>
+            <button class="port hub-port blue hub-top" data-port="piano-blue" data-color="blue" data-node-kind="audio" type="button" aria-label="蓝色端口"></button>
+            <button class="port hub-port pink hub-right" data-port="piano-pink" data-color="pink" data-node-kind="audio" type="button" aria-label="粉色端口"></button>
+            <button class="port hub-port green hub-left" data-port="piano-green" data-color="green" data-node-kind="audio" type="button" aria-label="绿色端口"></button>
+            <button class="port hub-port yellow hub-bottom" data-port="piano-yellow" data-color="yellow" data-node-kind="audio" type="button" aria-label="黄色端口"></button>
+          </article>
         </section>
       </div>
     </main>
 
-    <dialog id="audioDialog">
-      <form method="dialog" class="audio-form">
-        <h3>选择音频素材</h3>
-        <label>
-          音频列表
-          <select id="audioSelect"></select>
-        </label>
-        <menu>
-          <button value="cancel">取消</button>
-          <button id="confirmAudio" value="default">使用该音频</button>
-        </menu>
-      </form>
-    </dialog>
-
-    <audio id="player" preload="metadata"></audio>
     <script src="./script.js"></script>
   </body>
 </html>
