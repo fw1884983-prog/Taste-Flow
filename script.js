@@ -25,8 +25,9 @@ const NODE_DEFS = {
   frequency: {
     title: "频率 Peak",
     colors: ["blue", "pink", "yellow"],
-    audioParam: "frequency(X) / gain(Y) / Q(宽度)",
-    physics: "水滴位置决定频点，垂直决定增益，宽度决定精准度。",
+    audioParam: "BiquadFilterNode peaking：frequency / gain / Q",
+    physics:
+      "钟形 peaking：X→对数映射中心频率（约 80Hz–14kHz），Y 相对中线→增益 dB（上提突出频段、下压削弱），水滴水平半宽 rx→Q（越瘦带宽越窄、易出哨感）。湿声链上接在波形畸变与 ADSR 滤波之间。",
   },
   centroid: {
     title: "频谱重心",
@@ -44,14 +45,16 @@ const NODE_DEFS = {
   distortion: {
     title: "波形畸变",
     colors: ["blue", "pink"],
-    audioParam: "WaveShaperNode.curve",
-    physics: "压扁波形框即削顶，越扁谐波越多，质感更燥。",
+    audioParam: "WaveShaperNode.curve / oversample",
+    physics:
+      "振幅非线性映射：curve 将输入样本映射为输出；Drive 提高即 k 增大，进入削顶/软饱和区，转折增多→谐波增生（听感更燥、更金属）。湿声链：压缩器之后、ADSR 滤波之前；oversample 4x 减轻混叠。",
   },
   compression: {
     title: "动态挤压",
     colors: ["green"],
-    audioParam: "DynamicsCompressor.threshold / ratio",
-    physics: "弹性圈越扁动态越小，声音更紧实。",
+    audioParam: "DynamicsCompressorNode.threshold / ratio",
+    physics:
+      "竖向 Y→阈值 −60～−5 dB（越低越「挤压」）；横向 X→压缩比 1～12（越大峰越平、密度越高）。单例压缩器插在钢琴与 ADSR 滤波之间，实时 setTargetAtTime。",
   },
   reverb: {
     title: "混响",
@@ -62,8 +65,8 @@ const NODE_DEFS = {
   drywet: {
     title: "干湿比",
     colors: ["green", "blue"],
-    audioParam: "Dry.gain / Wet.gain",
-    physics: "重叠层透明度决定原始与处理信号的混合比例。",
+    audioParam: "GainNode 并联 Dry / Wet（等功率 cos/sin）",
+    physics: "钢琴经 master 后分两路：Dry 直达输出，Wet 经压缩器与 ADSR 滤波；mix∈[0,1] 控制干湿，中间响度更稳。",
   },
   phase: {
     title: "相位移动",
@@ -122,6 +125,13 @@ const colorMap = {
 
 const edgeKey = (a, b, c) => `${a}|${b}|${c}`;
 const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
+/** v 从 [inLo,inHi] 线性映射到 [outLo,outHi]（允许 inLo > inHi） */
+function mapRange(v, inLo, inHi, outLo, outHi) {
+  const span = inHi - inLo;
+  if (Math.abs(span) < 1e-9) return outLo;
+  const t = clamp((v - inLo) / span, 0, 1);
+  return outLo + t * (outHi - outLo);
+}
 
 /** 本地上传音频仅允许连续播放的最长时间（秒），从当前片段起点计。 */
 const MAX_LOCAL_PLAYBACK_SEC = 10;
@@ -135,7 +145,20 @@ const ADSR_FILTER_GAIN_SWING_DB = 16;
 
 let audioCtx = null;
 let masterGainNode = null;
+/** 钢琴 → compressor → ADSR 滤波；单例，由「动态挤压」面板驱动 */
+let dynamicsCompressorNode = null;
+/** 湿声链上压缩器之后：软饱和映射 + 4x 过采样，由「波形畸变」Drive 驱动 */
+let waveShaperNode = null;
+/** 0…1，与面板 Drive 一致；极低时退化为近似直通曲线 */
+let distortionDriveAmount = 0.4;
+/** 「频率 Peak」专用钟形滤波，与 ADSR 所用 peaking 串联；gain=0 时近似不改变频谱形状 */
+let parametricPeakNode = null;
+/** 并联干湿：Dry 直达 destination，Wet 进压缩器+滤波；由「干湿比」面板驱动 */
+let dryGainNode = null;
+let wetGainNode = null;
 let adsrFilterNode = null;
+/** 湿声比例 0=全干 1=全湿；增益用等功率曲线 */
+let dryWetMix = 1;
 /** 有琴键按下时使用的 ADSR 时间快照（秒），新一次发声开始时更新 */
 let adsrPlaySnapshot = null;
 let synthSessionStart = 0;
@@ -232,8 +255,58 @@ let phonographRecordingUrl = null;
 let phonographLastBlob = null;
 let phonographIsRecording = false;
 
+function setDryWetCrossfadeFromMix(mix) {
+  dryWetMix = clamp(mix, 0, 1);
+  if (!audioCtx || !dryGainNode || !wetGainNode) return;
+  const t0 = audioCtx.currentTime;
+  const dry = Math.cos(dryWetMix * 0.5 * Math.PI);
+  const wet = Math.sin(dryWetMix * 0.5 * Math.PI);
+  dryGainNode.gain.setTargetAtTime(dry, t0, 0.05);
+  wetGainNode.gain.setTargetAtTime(wet, t0, 0.05);
+}
+
+/** 与常见示例一致：k 控制饱和强度，x∈[-1,1] 映射到输出 */
+const WAVE_SHAPE_CURVE_LEN = 16385;
+
+function makeDistortionCurve(kAmount) {
+  const k = typeof kAmount === "number" && Number.isFinite(kAmount) ? kAmount : 50;
+  const n = WAVE_SHAPE_CURVE_LEN;
+  const curve = new Float32Array(n);
+  const deg = Math.PI / 180;
+  for (let i = 0; i < n; i += 1) {
+    const x = (i * 2) / (n - 1) - 1;
+    curve[i] = ((3 + k) * x * 20 * deg) / (Math.PI + k * Math.abs(x));
+  }
+  return curve;
+}
+
+function distortionCurveForDrive(drive01) {
+  const d = clamp(drive01, 0, 1);
+  if (d <= 0.02) {
+    const curve = new Float32Array(WAVE_SHAPE_CURVE_LEN);
+    for (let i = 0; i < WAVE_SHAPE_CURVE_LEN; i += 1) {
+      const x = (i * 2) / (WAVE_SHAPE_CURVE_LEN - 1) - 1;
+      curve[i] = x;
+    }
+    return curve;
+  }
+  const k = 1 + d * 99;
+  return makeDistortionCurve(k);
+}
+
 function ensureAudioGraph() {
-  if (audioCtx && masterGainNode && adsrFilterNode) return true;
+  if (
+    audioCtx &&
+    masterGainNode &&
+    dryGainNode &&
+    wetGainNode &&
+    dynamicsCompressorNode &&
+    waveShaperNode &&
+    parametricPeakNode &&
+    adsrFilterNode &&
+    mainAudioChainWired
+  )
+    return true;
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return false;
@@ -241,6 +314,42 @@ function ensureAudioGraph() {
     if (!masterGainNode) {
       masterGainNode = audioCtx.createGain();
       masterGainNode.gain.value = 0.18;
+    }
+    if (!dryGainNode) {
+      dryGainNode = audioCtx.createGain();
+      dryGainNode.gain.value = 0;
+    }
+    if (!wetGainNode) {
+      wetGainNode = audioCtx.createGain();
+      wetGainNode.gain.value = 1;
+    }
+    if (!dynamicsCompressorNode) {
+      dynamicsCompressorNode = audioCtx.createDynamicsCompressor();
+      dynamicsCompressorNode.knee.value = 5;
+      dynamicsCompressorNode.attack.value = 0.003;
+      dynamicsCompressorNode.release.value = 0.25;
+      dynamicsCompressorNode.threshold.value = -20;
+      dynamicsCompressorNode.ratio.value = 3;
+    }
+    if (!waveShaperNode) {
+      waveShaperNode = audioCtx.createWaveShaper();
+      try {
+        waveShaperNode.oversample = "4x";
+      } catch (_e) {
+        try {
+          waveShaperNode.oversample = "2x";
+        } catch (_e2) {
+          waveShaperNode.oversample = "none";
+        }
+      }
+      waveShaperNode.curve = distortionCurveForDrive(distortionDriveAmount);
+    }
+    if (!parametricPeakNode) {
+      parametricPeakNode = audioCtx.createBiquadFilter();
+      parametricPeakNode.type = "peaking";
+      parametricPeakNode.frequency.value = 1000;
+      parametricPeakNode.gain.value = 0;
+      parametricPeakNode.Q.value = 1.2;
     }
     if (!adsrFilterNode) {
       adsrFilterNode = audioCtx.createBiquadFilter();
@@ -250,9 +359,16 @@ function ensureAudioGraph() {
       adsrFilterNode.gain.value = ADSR_FILTER_GAIN_BASE_DB;
     }
     if (!mainAudioChainWired) {
-      masterGainNode.connect(adsrFilterNode);
+      masterGainNode.connect(dryGainNode);
+      dryGainNode.connect(audioCtx.destination);
+      masterGainNode.connect(wetGainNode);
+      wetGainNode.connect(dynamicsCompressorNode);
+      dynamicsCompressorNode.connect(waveShaperNode);
+      waveShaperNode.connect(parametricPeakNode);
+      parametricPeakNode.connect(adsrFilterNode);
       adsrFilterNode.connect(audioCtx.destination);
       mainAudioChainWired = true;
+      setDryWetCrossfadeFromMix(dryWetMix);
     }
     if (!recordStreamDestination) {
       recordStreamDestination = audioCtx.createMediaStreamDestination();
@@ -795,6 +911,20 @@ function clientToSvgUserX(svgEl, clientX) {
   return ((clientX - r.left) / Math.max(r.width, 1e-6)) * vw;
 }
 
+function clientToSvgUserY(svgEl, clientY) {
+  if (svgEl.createSVGPoint && svgEl.getScreenCTM) {
+    const pt = svgEl.createSVGPoint();
+    pt.x = 0;
+    pt.y = clientY;
+    const ctm = svgEl.getScreenCTM();
+    if (ctm) return pt.matrixTransform(ctm.inverse()).y;
+  }
+  const r = svgEl.getBoundingClientRect();
+  const vb = svgEl.viewBox?.baseVal;
+  const vh = vb?.height || r.height;
+  return ((clientY - r.top) / Math.max(r.height, 1e-6)) * vh;
+}
+
 function addPanelPorts(panel, colors, prefix) {
   const portColors = colors?.length ? colors : ["blue"];
   const total = portColors.length;
@@ -983,28 +1113,55 @@ function initPeak(host, valueEl) {
   drop.setAttribute("stroke", "#8a2f4a");
   drop.setAttribute("stroke-width", "2");
   svg.appendChild(drop);
+  const PEAK_X0 = 44;
+  const PEAK_X1 = 352;
+  const PEAK_Y0 = 36;
+  const PEAK_Y1 = 132;
+  const PEAK_CY_NEUTRAL = 84;
+  const PEAK_F_LO = 80;
+  const PEAK_F_HI = 14000;
   let cx = 194;
   let cy = 78;
   let dragging = false;
+
+  const pushParametricPeakFromUi = () => {
+    const spanX = Math.max(PEAK_X1 - PEAK_X0, 1e-6);
+    const tF = clamp((cx - PEAK_X0) / spanX, 0, 1);
+    const hz = PEAK_F_LO * (PEAK_F_HI / PEAK_F_LO) ** tF;
+    const gainDb = clamp((PEAK_CY_NEUTRAL - cy) * 0.42, -18, 18);
+    const rxVis = clamp((PEAK_Y1 - cy) / 4.2, 10, 24);
+    const qRaw = mapRange(rxVis, 24, 10, 0.55, 16);
+    const qClamped = clamp(qRaw, 0.26, 24);
+    void ensureAudioGraph();
+    if (audioCtx && parametricPeakNode) {
+      const t0 = audioCtx.currentTime;
+      parametricPeakNode.frequency.setTargetAtTime(hz, t0, 0.05);
+      parametricPeakNode.gain.setTargetAtTime(gainDb, t0, 0.05);
+      parametricPeakNode.Q.setTargetAtTime(qClamped, t0, 0.05);
+    }
+    return { hz, gainDb, qAudio: qClamped, rxVis };
+  };
+
   const redraw = () => {
-    cx = clamp(cx, 44, 352);
-    cy = clamp(cy, 36, 132);
+    cx = clamp(cx, PEAK_X0, PEAK_X1);
+    cy = clamp(cy, PEAK_Y0, PEAK_Y1);
     drop.setAttribute("cx", String(cx));
     drop.setAttribute("cy", String(cy));
-    const q = 1 + ((132 - cy) / 96) * 11;
-    drop.setAttribute("rx", String(clamp((132 - cy) / 4.2, 10, 24)));
+    const rxVis = clamp((PEAK_Y1 - cy) / 4.2, 10, 24);
+    drop.setAttribute("rx", String(rxVis));
     drop.setAttribute("ry", "14");
-    valueEl.textContent = `frequency:${Math.round(cx * 38)}Hz gain:${Math.round((132 - cy) / 3)} Q:${q.toFixed(1)}`;
+    const { hz, gainDb, qAudio } = pushParametricPeakFromUi();
+    valueEl.textContent = `${Math.round(hz)} Hz · ${gainDb >= 0 ? "+" : ""}${gainDb.toFixed(1)} dB · Q ${qAudio.toFixed(1)}`;
   };
   drop.addEventListener("mousedown", (e) => {
+    e.preventDefault();
     e.stopPropagation();
     dragging = true;
   });
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
-    const r = svg.getBoundingClientRect();
-    cx = e.clientX - r.left;
-    cy = e.clientY - r.top;
+    cx = clientToSvgUserX(svg, e.clientX);
+    cy = clientToSvgUserY(svg, e.clientY);
     redraw();
   });
   window.addEventListener("mouseup", () => {
@@ -1091,8 +1248,15 @@ function initDistortion(host, valueEl) {
   handle.setAttribute("stroke", "#27344a");
   handle.setAttribute("stroke-width", "4");
   svg.appendChild(handle);
-  let crush = 0.4;
+  let crush = distortionDriveAmount;
   let dragging = false;
+  const pushShaperCurve = () => {
+    distortionDriveAmount = crush;
+    void ensureAudioGraph();
+    if (waveShaperNode) {
+      waveShaperNode.curve = distortionCurveForDrive(crush);
+    }
+  };
   const redraw = () => {
     const up = 44 + crush * 45;
     const down = 126 - crush * 45;
@@ -1108,16 +1272,17 @@ function initDistortion(host, valueEl) {
     }
     wave.setAttribute("d", `M ${pts.join(" L ")}`);
     valueEl.textContent = `Drive:${Math.round(crush * 100)}%`;
+    pushShaperCurve();
   };
   handle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
     e.stopPropagation();
     dragging = true;
   });
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
-    const r = svg.getBoundingClientRect();
-    const y = e.clientY - r.top;
-    crush = clamp((126 - y) / 84, 0.05, 1);
+    const cy = clientToSvgUserY(svg, e.clientY);
+    crush = clamp((126 - cy) / 84, 0.05, 1);
     redraw();
   });
   window.addEventListener("mouseup", () => {
@@ -1129,9 +1294,15 @@ function initDistortion(host, valueEl) {
 function initCompression(host, valueEl) {
   const svg = createSvg(386, 170);
   host.appendChild(svg);
+  const CX = 194;
+  const CY = 86;
+  const THRESH_Y_LO = 132;
+  const THRESH_Y_HI = 38;
+  const RATIO_X_LO = 34;
+  const RATIO_X_HI = 352;
   const ring = document.createElementNS("http://www.w3.org/2000/svg", "ellipse");
-  ring.setAttribute("cx", "194");
-  ring.setAttribute("cy", "86");
+  ring.setAttribute("cx", String(CX));
+  ring.setAttribute("cy", String(CY));
   ring.setAttribute("fill", "rgba(145,196,124,0.2)");
   ring.setAttribute("stroke", "#4f8d47");
   ring.setAttribute("stroke-width", "5");
@@ -1140,25 +1311,40 @@ function initCompression(host, valueEl) {
   handle.setAttribute("r", "9");
   handle.setAttribute("fill", "#26492f");
   svg.appendChild(handle);
-  let rx = 92;
-  let ry = 56;
+  let hx = 92;
+  let hy = 64;
   let dragging = false;
+
+  const pushCompressorParams = (thresholdDb, ratio) => {
+    if (!ensureAudioGraph() || !audioCtx || !dynamicsCompressorNode) return;
+    const t0 = audioCtx.currentTime;
+    dynamicsCompressorNode.threshold.setTargetAtTime(thresholdDb, t0, 0.1);
+    dynamicsCompressorNode.ratio.setTargetAtTime(ratio, t0, 0.1);
+  };
+
   const redraw = () => {
-    ring.setAttribute("rx", String(rx));
-    ring.setAttribute("ry", String(ry));
-    handle.setAttribute("cx", String(194 + rx));
-    handle.setAttribute("cy", String(86 - ry));
-    valueEl.textContent = `threshold:${(-60 + (ry / 56) * 54).toFixed(1)}dB ratio:${(rx / ry).toFixed(2)}`;
+    hx = clamp(hx, RATIO_X_LO, RATIO_X_HI);
+    hy = clamp(hy, THRESH_Y_HI, THRESH_Y_LO);
+    const thresholdDb = mapRange(hy, THRESH_Y_LO, THRESH_Y_HI, -60, -5);
+    const ratio = mapRange(hx, RATIO_X_LO, RATIO_X_HI, 1, 12);
+    const rxVis = Math.max(16, hx - CX);
+    const ryVis = clamp(THRESH_Y_LO - hy, 8, 96);
+    ring.setAttribute("rx", String(rxVis));
+    ring.setAttribute("ry", String(ryVis));
+    handle.setAttribute("cx", String(hx));
+    handle.setAttribute("cy", String(hy));
+    valueEl.textContent = `${thresholdDb.toFixed(1)} dB · 1∶${ratio.toFixed(1)}`;
+    pushCompressorParams(thresholdDb, ratio);
   };
   handle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
     e.stopPropagation();
     dragging = true;
   });
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
-    const r = svg.getBoundingClientRect();
-    rx = clamp(e.clientX - r.left - 194, 44, 124);
-    ry = clamp(86 - (e.clientY - r.top), 20, 74);
+    hx = clientToSvgUserX(svg, e.clientX);
+    hy = clientToSvgUserY(svg, e.clientY);
     redraw();
   });
   window.addEventListener("mouseup", () => {
@@ -1234,22 +1420,26 @@ function initDryWet(host, valueEl) {
   handle.setAttribute("r", "8");
   handle.setAttribute("fill", "#1f2b3f");
   svg.appendChild(handle);
-  let wetMix = 0.45;
+  let wetMix = dryWetMix;
   let dragging = false;
   const redraw = () => {
     const y = 136 - wetMix * 86;
     handle.setAttribute("cy", String(y));
     wet.setAttribute("opacity", String(0.2 + wetMix * 0.8));
-    valueEl.textContent = `Dry:${Math.round((1 - wetMix) * 100)}% Wet:${Math.round(wetMix * 100)}%`;
+    dry.setAttribute("opacity", String(0.2 + (1 - wetMix) * 0.8));
+    valueEl.textContent = `Dry:${Math.round((1 - wetMix) * 100)}% Wet:${Math.round(wetMix * 100)}% · 等功率`;
+    void ensureAudioGraph();
+    setDryWetCrossfadeFromMix(wetMix);
   };
   handle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
     e.stopPropagation();
     dragging = true;
   });
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
-    const r = svg.getBoundingClientRect();
-    wetMix = clamp((136 - (e.clientY - r.top)) / 86, 0, 1);
+    const cy = clientToSvgUserY(svg, e.clientY);
+    wetMix = clamp((136 - cy) / 86, 0, 1);
     redraw();
   });
   window.addEventListener("mouseup", () => {
@@ -1384,6 +1574,48 @@ function initWidget(type, host, valueEl) {
   if (type === "grain") return initGrain(host, valueEl);
 }
 
+/** 关闭对应节点面板时，将已作用在全局音频图上的参数恢复初始值（不保留该面板调节） */
+function resetGlobalAudioEffectForNodeType(nodeType) {
+  switch (nodeType) {
+    case "compression":
+      if (audioCtx && dynamicsCompressorNode) {
+        const t0 = audioCtx.currentTime;
+        dynamicsCompressorNode.threshold.setTargetAtTime(-20, t0, 0.08);
+        dynamicsCompressorNode.ratio.setTargetAtTime(3, t0, 0.08);
+      }
+      break;
+    case "drywet":
+      dryWetMix = 1;
+      setDryWetCrossfadeFromMix(1);
+      break;
+    case "distortion":
+      distortionDriveAmount = 0.4;
+      if (waveShaperNode) {
+        waveShaperNode.curve = distortionCurveForDrive(0.4);
+      }
+      break;
+    case "adsr":
+      adsrTimeAxisPx = {
+        x0: ADSR_S_X,
+        xR: Math.min(ADSR_U_X + 120, ADSR_R_MAX_X),
+        xa: 90,
+        xd: 150,
+        xu: ADSR_U_X,
+      };
+      break;
+    case "frequency":
+      if (audioCtx && parametricPeakNode) {
+        const t0 = audioCtx.currentTime;
+        parametricPeakNode.frequency.setTargetAtTime(1000, t0, 0.06);
+        parametricPeakNode.gain.setTargetAtTime(0, t0, 0.06);
+        parametricPeakNode.Q.setTargetAtTime(1.2, t0, 0.06);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
 function createNodePanel(type, x, y) {
   const def = NODE_DEFS[type];
   if (!def) return;
@@ -1436,6 +1668,7 @@ function createNodePanel(type, x, y) {
 
   close.addEventListener("click", () => {
     removeEdgesForPrefix(prefix);
+    resetGlobalAudioEffectForNodeType(type);
     panel.remove();
   });
 }
