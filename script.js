@@ -1,5 +1,13 @@
 const PANEL_W = 386;
 const PANEL_H = 276;
+/** ADSR 小窗加宽；与下方 SVG 宽度一致以便 R 段横向延伸 */
+const PANEL_W_ADSR = 520;
+const ADSR_SVG_W = 500;
+const ADSR_S_X = 20;
+const ADSR_U_X = 260;
+/** R 端点最大 x；`(R_MAX−U)` 映射 5.0s */
+const ADSR_R_MAX_X = ADSR_SVG_W - 20;
+const ADSR_R_MAP_SPAN = Math.max(ADSR_R_MAX_X - ADSR_U_X, 1e-6);
 
 const NODE_DEFS = {
   lpf: {
@@ -29,8 +37,9 @@ const NODE_DEFS = {
   adsr: {
     title: "ADSR",
     colors: ["blue"],
-    audioParam: "BiquadFilterNode.frequency（相对 1.0 / 峰值 1.2）",
-    physics: "横轴总长=合成时间窗（10s）；仅拖 X 定 A/D/S 分界；A 顶 ×1.2 频、S 段原频；不调音量；新一次按键发声时生效。",
+    audioParam: "BiquadFilterNode.frequency + gain（A 顶更明显；R→各声部音量尾音秒）",
+    physics:
+      "S 起点与 S 段终点 U 在图上固定；其间仅拖 A、D 两点划分 A/D/S 比重（和为 1，A≤½），ADS 无独立秒数仅比例；R 端可沿横轴后拉，U→R 距离映射 0–5.0s；实际 ADS 总时长仍由上次整段弹奏缩放；松键按 R 回落；新一次按键生效。",
   },
   distortion: {
     title: "波形畸变",
@@ -82,6 +91,12 @@ const presetMenuToggle = document.getElementById("presetMenuToggle");
 const pianoRig = document.getElementById("pianoRig");
 const pianoKeys = document.getElementById("pianoKeys");
 const pianoDragHandle = document.getElementById("pianoDragHandle");
+const phonographRig = document.getElementById("phonographRig");
+const phonographDragHandle = document.getElementById("phonographDragHandle");
+const phonographRecordBtn = document.getElementById("phonographRecordBtn");
+const phonographDisc = document.getElementById("phonographDisc");
+const phonographSaveBtn = document.getElementById("phonographSaveBtn");
+const phonographPlayback = document.getElementById("phonographPlayback");
 
 let panelCounter = 1;
 let edges = [];
@@ -111,10 +126,12 @@ const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
 /** 本地上传音频仅允许连续播放的最长时间（秒），从当前片段起点计。 */
 const MAX_LOCAL_PLAYBACK_SEC = 10;
 
-/** ADSR 频率调制：相对中心频率的倍数（A 顶 1.2，S 段 1.0），不调增益。 */
+/** ADSR：相对中心频率的倍数（A 顶 1.2，S 段 1.0）；并联动 peaking 的 gain(dB) 便于听辨 ADS。 */
 const ADSR_FREQ_BASE_HZ = 2600;
 const ADSR_FREQ_PEAK = 1.2;
 const ADSR_FREQ_SUSTAIN = 1;
+const ADSR_FILTER_GAIN_BASE_DB = 4;
+const ADSR_FILTER_GAIN_SWING_DB = 16;
 
 let audioCtx = null;
 let masterGainNode = null;
@@ -126,35 +143,59 @@ let adsrRafId = 0;
 const pianoVoices = new Map();
 const pianoKeyButtons = new Map();
 const computerPianoCodes = new Set();
-/** 与 ADSR 面板同步的横向像素；横轴总时长 = 可播放窗口（与 MAX_LOCAL_PLAYBACK_SEC 一致） */
-let adsrTimeAxisPx = { x0: 20, xR: 360, xa: 90, xd: 150, xu: 260 };
+/** 与 ADSR 面板同步：x0/xu 为 ADS 视觉段起止，xR 为 R 段末端；R 像素跨度映射 0–5s */
+let adsrTimeAxisPx = { x0: ADSR_S_X, xR: Math.min(ADSR_U_X + 120, ADSR_R_MAX_X), xa: 90, xd: 150, xu: ADSR_U_X };
 
-/** ADSR 横轴总秒数：与合成时间窗一致（当前 10s），对应当前钢琴 ADSR 调制周期 */
-function getAdsrTimelineDurationSec() {
-  return MAX_LOCAL_PLAYBACK_SEC;
-}
+/** 上次「整次弹奏」从首键按下到末键抬起的时长（秒），供下一次 ADS 总时长使用 */
+let lastPianoHoldSec = 2.5;
+/** 松键后滤波包络按 R 秒线性回落 */
+let adsrReleasePhase = null;
 
 function syncAdsrTimeAxisPxFromShape(p) {
   adsrTimeAxisPx = { x0: p.s.x, xR: p.r.x, xa: p.a.x, xd: p.d.x, xu: p.u.x };
 }
 
 function buildAdsrSnapshot() {
-  const D = getAdsrTimelineDurationSec();
   const { x0, xR, xa, xd, xu } = adsrTimeAxisPx;
-  const span = Math.max(xR - x0, 1e-6);
-  let tA = ((xa - x0) / span) * D;
-  let tD = ((xd - x0) / span) * D;
-  let tU = ((xu - x0) / span) * D;
-  tA = clamp(tA, 0, D);
-  tD = clamp(Math.max(tA, tD), 0, D);
-  tU = clamp(Math.max(tD, tU), 0, D);
-  return { D, tA, tD, tU };
+  const L_ads = Math.max(xu - x0, 1e-6);
+  let rawA = (xa - x0) / L_ads;
+  let rawD = (xd - xa) / L_ads;
+  let rawS = (xu - xd) / L_ads;
+  rawA = clamp(rawA, 0, 1);
+  rawD = Math.max(0, rawD);
+  rawS = Math.max(0, rawS);
+  const rawSum = rawA + rawD + rawS;
+  if (rawSum > 1e-6) {
+    rawA /= rawSum;
+    rawD /= rawSum;
+    rawS /= rawSum;
+  } else {
+    rawA = 0.25;
+    rawD = 0.35;
+    rawS = 0.4;
+  }
+  let alphaA = Math.min(rawA, 0.5);
+  const rem = 1 - alphaA;
+  const dsf = rawD + rawS;
+  let alphaD = dsf > 1e-6 ? (rem * rawD) / dsf : rem * 0.5;
+  let alphaS = rem - alphaD;
+  if (alphaS < 0) {
+    alphaS = 0;
+    alphaD = rem;
+  }
+  const T_ads = clamp(lastPianoHoldSec, 0.1, 30);
+  const tA = alphaA * T_ads;
+  const tD = tA + alphaD * T_ads;
+  const tU = T_ads;
+  const gapR = Math.max(xR - xu, 0);
+  const tR = clamp((gapR / ADSR_R_MAP_SPAN) * 5, 0, 5);
+  return { tA, tD, tU, tR, T_ads, alphaA, alphaD, alphaS };
 }
 
 function adsrFreqMultiplierAt(t, snap) {
   if (!snap) return ADSR_FREQ_SUSTAIN;
-  const { D, tA, tD, tU } = snap;
-  const tc = clamp(t, 0, D);
+  const { tA, tD, tU } = snap;
+  const tc = clamp(t, 0, tU);
   if (tc <= tA) {
     const w = tA > 1e-6 ? tc / tA : 1;
     return ADSR_FREQ_SUSTAIN + (ADSR_FREQ_PEAK - ADSR_FREQ_SUSTAIN) * w;
@@ -167,7 +208,29 @@ function adsrFreqMultiplierAt(t, snap) {
   return ADSR_FREQ_SUSTAIN;
 }
 
+/** 当前快照下的 R（秒）：用于钢琴声部松键后的音量尾音；与面板 0–5s 一致 */
+function getPianoReleaseSeconds() {
+  const tr = adsrPlaySnapshot && typeof adsrPlaySnapshot.tR === "number" ? adsrPlaySnapshot.tR : null;
+  if (tr == null || !Number.isFinite(tr)) return 0.12;
+  return clamp(tr, 0.02, 5);
+}
+
+function applyAdsrPeakingFromMultiplier(m) {
+  if (!audioCtx || !adsrFilterNode) return;
+  const t = audioCtx.currentTime;
+  adsrFilterNode.frequency.setTargetAtTime(ADSR_FREQ_BASE_HZ * m, t, 0.022);
+  const gDb = ADSR_FILTER_GAIN_BASE_DB + (m - ADSR_FREQ_SUSTAIN) * ADSR_FILTER_GAIN_SWING_DB;
+  adsrFilterNode.gain.setTargetAtTime(clamp(gDb, -2, 20), t, 0.03);
+}
+
 let mainAudioChainWired = false;
+let recordStreamDestination = null;
+let recordTapWired = false;
+let phonographMediaRecorder = null;
+let phonographChunks = [];
+let phonographRecordingUrl = null;
+let phonographLastBlob = null;
+let phonographIsRecording = false;
 
 function ensureAudioGraph() {
   if (audioCtx && masterGainNode && adsrFilterNode) return true;
@@ -184,12 +247,19 @@ function ensureAudioGraph() {
       adsrFilterNode.type = "peaking";
       adsrFilterNode.frequency.value = ADSR_FREQ_BASE_HZ * ADSR_FREQ_SUSTAIN;
       adsrFilterNode.Q.value = 1.1;
-      adsrFilterNode.gain.value = 4;
+      adsrFilterNode.gain.value = ADSR_FILTER_GAIN_BASE_DB;
     }
     if (!mainAudioChainWired) {
       masterGainNode.connect(adsrFilterNode);
       adsrFilterNode.connect(audioCtx.destination);
       mainAudioChainWired = true;
+    }
+    if (!recordStreamDestination) {
+      recordStreamDestination = audioCtx.createMediaStreamDestination();
+    }
+    if (!recordTapWired && adsrFilterNode) {
+      adsrFilterNode.connect(recordStreamDestination);
+      recordTapWired = true;
     }
     return true;
   } catch (_e) {
@@ -197,18 +267,28 @@ function ensureAudioGraph() {
   }
 }
 
-function getSynthTimelineSec() {
-  if (!audioCtx) return 0;
-  const elapsed = audioCtx.currentTime - synthSessionStart;
-  const mod = elapsed % MAX_LOCAL_PLAYBACK_SEC;
-  return mod < 0 ? 0 : mod;
-}
-
 function applyAdsrFilterFromSynthClock() {
-  if (!audioCtx || !adsrFilterNode || !adsrPlaySnapshot || pianoVoices.size === 0) return;
-  const t = getSynthTimelineSec();
-  const m = adsrFreqMultiplierAt(t, adsrPlaySnapshot);
-  adsrFilterNode.frequency.setTargetAtTime(ADSR_FREQ_BASE_HZ * m, audioCtx.currentTime, 0.02);
+  if (!audioCtx || !adsrFilterNode) return;
+
+  if (pianoVoices.size > 0 && adsrPlaySnapshot) {
+    const t = audioCtx.currentTime - synthSessionStart;
+    const m = adsrFreqMultiplierAt(t, adsrPlaySnapshot);
+    applyAdsrPeakingFromMultiplier(m);
+    return;
+  }
+
+  if (adsrReleasePhase) {
+    const elapsed = audioCtx.currentTime - adsrReleasePhase.start;
+    const tr = clamp(adsrReleasePhase.snap.tR, 0, 5);
+    if (elapsed >= tr) {
+      applyAdsrPeakingFromMultiplier(ADSR_FREQ_SUSTAIN);
+      adsrReleasePhase = null;
+      return;
+    }
+    const w = tr > 1e-6 ? elapsed / tr : 1;
+    const m = adsrReleasePhase.fromM + (ADSR_FREQ_SUSTAIN - adsrReleasePhase.fromM) * w;
+    applyAdsrPeakingFromMultiplier(m);
+  }
 }
 
 function stopAdsrRafLoop() {
@@ -218,12 +298,13 @@ function stopAdsrRafLoop() {
 
 function adsrRafLoop() {
   applyAdsrFilterFromSynthClock();
-  if (pianoVoices.size > 0) {
+  const keep = pianoVoices.size > 0 || adsrReleasePhase !== null;
+  if (keep) {
     adsrRafId = requestAnimationFrame(adsrRafLoop);
   } else {
     adsrRafId = 0;
     if (audioCtx && adsrFilterNode) {
-      adsrFilterNode.frequency.setTargetAtTime(ADSR_FREQ_BASE_HZ * ADSR_FREQ_SUSTAIN, audioCtx.currentTime, 0.06);
+      applyAdsrPeakingFromMultiplier(ADSR_FREQ_SUSTAIN);
     }
   }
 }
@@ -237,6 +318,7 @@ function midiToHz(midi) {
   return 440 * 2 ** ((midi - 69) / 12);
 }
 
+/** 两八度 C4–C6（60–84）：下排 Z 行 C4–B4，上排 Q 行 C5–C6 */
 const KEYBOARD_TO_MIDI = {
   KeyZ: 60,
   KeyS: 61,
@@ -250,120 +332,219 @@ const KEYBOARD_TO_MIDI = {
   KeyN: 69,
   KeyJ: 70,
   KeyM: 71,
-  Comma: 72,
+  KeyQ: 72,
+  Digit2: 73,
+  KeyW: 74,
+  Digit3: 75,
+  KeyE: 76,
+  KeyR: 77,
+  Digit5: 78,
+  KeyT: 79,
+  Digit6: 80,
+  KeyY: 81,
+  Digit7: 82,
+  KeyU: 83,
+  KeyI: 84,
 };
 
-const PIANO_NOTE_LABELS = { 60: "C", 61: "C#", 62: "D", 63: "D#", 64: "E", 65: "F", 66: "F#", 67: "G", 68: "G#", 69: "A", 70: "A#", 71: "B", 72: "C" };
-const PIANO_WHITE_MIDI = [60, 62, 64, 65, 67, 69, 71, 72];
-const PIANO_BLACK_SPECS = [
-  { midi: 61, afterWhiteIndex: 0 },
-  { midi: 63, afterWhiteIndex: 1 },
-  { midi: 66, afterWhiteIndex: 3 },
-  { midi: 68, afterWhiteIndex: 4 },
-  { midi: 70, afterWhiteIndex: 5 },
-];
-const PIANO_WHITE_W = 44;
-const PIANO_KEY_GAP = 3;
-const PIANO_BLACK_W = 24;
+const PIANO_MIDI_MIN = 60;
+const PIANO_MIDI_MAX = 84;
+const PIANO_WHITE_W = 36;
+const PIANO_KEY_GAP = 2;
+const PIANO_BLACK_W = 22;
+/** 键间滑音时长（秒），库乐队式连续滑音 */
+const PIANO_PORTAMENTO_SEC = 0.09;
 
-function wirePianoKeyButton(btn, midi) {
-  btn.addEventListener("pointerdown", (e) => {
-    e.preventDefault();
-    try {
-      btn.setPointerCapture(e.pointerId);
-    } catch (_err) {}
-    btn.classList.add("is-down");
-    pianoNoteOn(midi);
-  });
-  btn.addEventListener("pointerup", (e) => {
-    btn.classList.remove("is-down");
-    try {
-      if (btn.hasPointerCapture(e.pointerId)) btn.releasePointerCapture(e.pointerId);
-    } catch (_err) {}
-    pianoNoteOff(midi);
-  });
-  btn.addEventListener("pointercancel", () => {
-    btn.classList.remove("is-down");
-    pianoNoteOff(midi);
-  });
+const PIANO_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+function midiLabel(m) {
+  return `${PIANO_NAMES[m % 12]}${Math.floor(m / 12) - 1}`;
 }
 
-function pianoNoteOn(midi) {
+function isBlackMidi(m) {
+  return [1, 3, 6, 8, 10].includes(m % 12);
+}
+
+function buildPianoWhiteBlackLayout() {
+  const whites = [];
+  for (let m = PIANO_MIDI_MIN; m <= PIANO_MIDI_MAX; m += 1) {
+    if (!isBlackMidi(m)) whites.push(m);
+  }
+  const blacks = [];
+  for (let m = PIANO_MIDI_MIN; m <= PIANO_MIDI_MAX; m += 1) {
+    if (!isBlackMidi(m)) continue;
+    let after = -1;
+    for (let i = 0; i < whites.length - 1; i += 1) {
+      if (whites[i] < m && m < whites[i + 1]) {
+        after = i;
+        break;
+      }
+    }
+    if (after >= 0) blacks.push({ midi: m, afterWhiteIndex: after });
+  }
+  return { whites, blacks };
+}
+
+const capturedPianoPointers = new Set();
+
+function glideOscFrequencyTo(osc, hz, immediate) {
+  if (!audioCtx || !osc) return;
+  const t = audioCtx.currentTime;
+  osc.frequency.cancelScheduledValues(t);
+  const cur = osc.frequency.value;
+  osc.frequency.setValueAtTime(cur, t);
+  if (immediate) {
+    osc.frequency.setValueAtTime(hz, t);
+  } else {
+    osc.frequency.linearRampToValueAtTime(hz, t + PIANO_PORTAMENTO_SEC);
+  }
+}
+
+/** voiceId: `p:${pointerId}` 或 `k:${KeyboardEvent.code}` */
+function pianoNoteOn(voiceId, midi, immediateAttack) {
   if (!ensureAudioGraph() || !audioCtx || !masterGainNode) return;
-  if (pianoVoices.has(midi)) return;
+  void audioCtx.resume();
+
+  const existing = pianoVoices.get(voiceId);
+  if (existing) {
+    if (existing.lastMidi === midi) return;
+    glideOscFrequencyTo(existing.osc, midiToHz(midi), !!immediateAttack);
+    pianoKeyButtons.get(existing.lastMidi)?.classList.remove("is-down");
+    pianoKeyButtons.get(midi)?.classList.add("is-down");
+    existing.lastMidi = midi;
+    return;
+  }
+
   const wasEmpty = pianoVoices.size === 0;
   const t0 = audioCtx.currentTime;
   if (wasEmpty) {
+    adsrReleasePhase = null;
     adsrPlaySnapshot = buildAdsrSnapshot();
     synthSessionStart = t0;
     startAdsrRafLoop();
   }
-  void audioCtx.resume();
 
   const osc = audioCtx.createOscillator();
   osc.type = "triangle";
-  osc.frequency.setValueAtTime(midiToHz(midi), t0);
+  const hz = midiToHz(midi);
+  osc.frequency.setValueAtTime(hz, t0);
   const g = audioCtx.createGain();
   g.gain.setValueAtTime(0.0001, t0);
   g.gain.linearRampToValueAtTime(0.16, t0 + 0.02);
   osc.connect(g);
   g.connect(masterGainNode);
   osc.start(t0);
-  pianoVoices.set(midi, { osc, gainNode: g });
+  pianoVoices.set(voiceId, { osc, gainNode: g, lastMidi: midi });
+  pianoKeyButtons.get(midi)?.classList.add("is-down");
 }
 
-function pianoNoteOff(midi) {
-  const v = pianoVoices.get(midi);
+function pianoNoteOff(voiceId) {
+  const v = pianoVoices.get(voiceId);
   if (!v || !audioCtx) return;
   const t = audioCtx.currentTime;
-  const { osc, gainNode: g } = v;
+  const willBeEmpty = pianoVoices.size === 1;
+  if (willBeEmpty) {
+    lastPianoHoldSec = clamp(t - synthSessionStart, 0.08, 30);
+    if (adsrPlaySnapshot) {
+      const tPos = clamp(t - synthSessionStart, 0, adsrPlaySnapshot.T_ads);
+      const fromM = adsrFreqMultiplierAt(tPos, adsrPlaySnapshot);
+      adsrReleasePhase = { start: t, fromM, snap: adsrPlaySnapshot };
+    }
+  }
+  const { osc, gainNode: g, lastMidi } = v;
+  const releaseSec = getPianoReleaseSeconds();
   g.gain.cancelScheduledValues(t);
   g.gain.setValueAtTime(Math.max(g.gain.value, 0.0001), t);
-  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + releaseSec);
   try {
-    osc.stop(t + 0.13);
+    osc.stop(t + releaseSec + 0.08);
   } catch (_e) {}
-  pianoVoices.delete(midi);
-  if (pianoVoices.size === 0) stopAdsrRafLoop();
+  pianoVoices.delete(voiceId);
+  pianoKeyButtons.get(lastMidi)?.classList.remove("is-down");
+  if (pianoVoices.size === 0) {
+    startAdsrRafLoop();
+  }
 }
 
 function buildPianoKeys() {
   if (!pianoKeys) return;
   pianoKeyButtons.clear();
   pianoKeys.innerHTML = "";
+  const { whites, blacks } = buildPianoWhiteBlackLayout();
   const whitesWrap = document.createElement("div");
   whitesWrap.className = "piano-keys__whites";
-  const totalW = PIANO_WHITE_MIDI.length * PIANO_WHITE_W + (PIANO_WHITE_MIDI.length - 1) * PIANO_KEY_GAP;
+  const totalW = whites.length * PIANO_WHITE_W + (whites.length - 1) * PIANO_KEY_GAP;
   pianoKeys.style.width = `${totalW}px`;
 
-  PIANO_WHITE_MIDI.forEach((midi) => {
+  whites.forEach((midi) => {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "piano-key piano-key--white";
     btn.dataset.midi = String(midi);
-    btn.textContent = PIANO_NOTE_LABELS[midi] || "";
-    wirePianoKeyButton(btn, midi);
+    btn.textContent = midiLabel(midi);
     whitesWrap.appendChild(btn);
     pianoKeyButtons.set(midi, btn);
   });
   pianoKeys.appendChild(whitesWrap);
 
-  PIANO_BLACK_SPECS.forEach(({ midi, afterWhiteIndex }) => {
+  blacks.forEach(({ midi, afterWhiteIndex }) => {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "piano-key piano-key--black";
     btn.dataset.midi = String(midi);
-    btn.textContent = PIANO_NOTE_LABELS[midi] || "";
+    btn.textContent = midiLabel(midi);
     const left = afterWhiteIndex * (PIANO_WHITE_W + PIANO_KEY_GAP) + PIANO_WHITE_W - PIANO_BLACK_W / 2;
     btn.style.left = `${left}px`;
-    wirePianoKeyButton(btn, midi);
     pianoKeys.appendChild(btn);
     pianoKeyButtons.set(midi, btn);
   });
 }
 
+function wirePianoPointerDelegation() {
+  if (!pianoKeys) return;
+
+  pianoKeys.addEventListener("pointerdown", (e) => {
+    const key = e.target.closest(".piano-key");
+    if (!key) return;
+    e.preventDefault();
+    const midi = Number(key.dataset.midi);
+    if (!Number.isFinite(midi)) return;
+    const voiceId = `p:${e.pointerId}`;
+    try {
+      pianoKeys.setPointerCapture(e.pointerId);
+    } catch (_err) {}
+    capturedPianoPointers.add(e.pointerId);
+    pianoNoteOn(voiceId, midi, true);
+  });
+
+  pianoKeys.addEventListener("pointermove", (e) => {
+    if (!capturedPianoPointers.has(e.pointerId)) return;
+    const voiceId = `p:${e.pointerId}`;
+    if (!pianoVoices.has(voiceId)) return;
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const key = el && el.closest && el.closest(".piano-key");
+    if (!key || !pianoKeys.contains(key)) return;
+    const midi = Number(key.dataset.midi);
+    if (!Number.isFinite(midi)) return;
+    pianoNoteOn(voiceId, midi, false);
+  });
+
+  const endPointer = (e) => {
+    if (!capturedPianoPointers.has(e.pointerId)) return;
+    capturedPianoPointers.delete(e.pointerId);
+    const voiceId = `p:${e.pointerId}`;
+    pianoNoteOff(voiceId);
+    try {
+      if (pianoKeys.hasPointerCapture(e.pointerId)) pianoKeys.releasePointerCapture(e.pointerId);
+    } catch (_err) {}
+  };
+  pianoKeys.addEventListener("pointerup", endPointer);
+  pianoKeys.addEventListener("pointercancel", endPointer);
+}
+
 function wirePiano() {
   buildPianoKeys();
+  wirePianoPointerDelegation();
 
   window.addEventListener("keydown", (e) => {
     if (e.repeat) return;
@@ -374,9 +555,8 @@ function wirePiano() {
     e.preventDefault();
     if (computerPianoCodes.has(e.code)) return;
     computerPianoCodes.add(e.code);
-    const btn = pianoKeyButtons.get(midi);
-    if (btn) btn.classList.add("is-down");
-    pianoNoteOn(midi);
+    const voiceId = `k:${e.code}`;
+    pianoNoteOn(voiceId, midi, true);
   });
 
   window.addEventListener("keyup", (e) => {
@@ -384,20 +564,20 @@ function wirePiano() {
     if (midi == null) return;
     if (e.target.closest(".sidebar")) return;
     computerPianoCodes.delete(e.code);
-    const btn = pianoKeyButtons.get(midi);
-    if (btn) btn.classList.remove("is-down");
-    pianoNoteOff(midi);
+    const voiceId = `k:${e.code}`;
+    pianoNoteOff(voiceId);
   });
 
   window.addEventListener("blur", () => {
     [...computerPianoCodes].forEach((code) => {
-      const midi = KEYBOARD_TO_MIDI[code];
-      if (midi != null) {
-        pianoKeyButtons.get(midi)?.classList.remove("is-down");
-        pianoNoteOff(midi);
-      }
+      const voiceId = `k:${code}`;
+      pianoNoteOff(voiceId);
       computerPianoCodes.delete(code);
     });
+    capturedPianoPointers.forEach((pid) => {
+      pianoNoteOff(`p:${pid}`);
+    });
+    capturedPianoPointers.clear();
   });
 }
 
@@ -481,6 +661,27 @@ function renderEdges() {
   if (portDrag) {
     edgeLayer.appendChild(makeLine(getPoint(portDrag.fromEl), portDrag.cursor, portDrag.color));
   }
+
+  appendPhonographVirtualEdge();
+}
+
+function appendPhonographVirtualEdge() {
+  const a0 = document.getElementById("pianoAttachAnchor");
+  const a1 = document.getElementById("phonographAttachAnchor");
+  if (!a0 || !a1) return;
+  const from = getPoint(a0);
+  const to = getPoint(a1);
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  line.setAttribute("x1", String(from.x));
+  line.setAttribute("y1", String(from.y));
+  line.setAttribute("x2", String(to.x));
+  line.setAttribute("y2", String(to.y));
+  line.setAttribute("stroke", "#9588a5");
+  line.setAttribute("stroke-width", "2");
+  line.setAttribute("stroke-dasharray", "8 6");
+  line.setAttribute("stroke-linecap", "round");
+  line.setAttribute("opacity", "0.88");
+  edgeLayer.appendChild(line);
 }
 
 function removeEdgesForPrefix(prefix) {
@@ -579,6 +780,21 @@ function createSvg(w, h) {
   return svg;
 }
 
+/** 将屏幕 x 转为 SVG 用户坐标（避免 viewBox 缩放后拖动手感错位） */
+function clientToSvgUserX(svgEl, clientX) {
+  if (svgEl.createSVGPoint && svgEl.getScreenCTM) {
+    const pt = svgEl.createSVGPoint();
+    pt.x = clientX;
+    pt.y = 0;
+    const ctm = svgEl.getScreenCTM();
+    if (ctm) return pt.matrixTransform(ctm.inverse()).x;
+  }
+  const r = svgEl.getBoundingClientRect();
+  const vb = svgEl.viewBox?.baseVal;
+  const vw = vb?.width || r.width;
+  return ((clientX - r.left) / Math.max(r.width, 1e-6)) * vw;
+}
+
 function addPanelPorts(panel, colors, prefix) {
   const portColors = colors?.length ? colors : ["blue"];
   const total = portColors.length;
@@ -596,17 +812,21 @@ function addPanelPorts(panel, colors, prefix) {
 }
 
 function initAdsr(host, valueEl) {
-  const svg = createSvg(386, 170);
+  valueEl.textContent = "";
+  valueEl.style.pointerEvents = "none";
+  valueEl.style.visibility = "hidden";
+
+  const svg = createSvg(ADSR_SVG_W, 170);
   host.appendChild(svg);
   const Y_BASE = 150;
   const Y_PEAK = 24;
   const Y_SUST = 76;
   const p = {
-    s: { x: 20, y: Y_BASE },
+    s: { x: ADSR_S_X, y: Y_BASE },
     a: { x: 90, y: Y_PEAK },
     d: { x: 150, y: Y_SUST },
-    u: { x: 260, y: Y_SUST },
-    r: { x: 360, y: Y_BASE },
+    u: { x: ADSR_U_X, y: Y_SUST },
+    r: { x: Math.min(ADSR_U_X + 120, ADSR_R_MAX_X), y: Y_BASE },
   };
   const axis = document.createElementNS("http://www.w3.org/2000/svg", "line");
   axis.setAttribute("x1", String(p.s.x));
@@ -617,76 +837,78 @@ function initAdsr(host, valueEl) {
   axis.setAttribute("stroke-width", "1");
   axis.setAttribute("stroke-dasharray", "4 4");
   svg.appendChild(axis);
-  const axisCap = document.createElementNS("http://www.w3.org/2000/svg", "text");
-  axisCap.setAttribute("x", String(p.r.x - 2));
-  axisCap.setAttribute("y", String(Y_BASE + 20));
-  axisCap.setAttribute("text-anchor", "end");
-  axisCap.setAttribute("fill", "#4a5568");
-  axisCap.setAttribute("font-size", "11");
-  axisCap.textContent = `时间 → 0–${MAX_LOCAL_PLAYBACK_SEC}s（可播窗口）`;
-  svg.appendChild(axisCap);
 
   const poly = document.createElementNS("http://www.w3.org/2000/svg", "path");
   poly.setAttribute("fill", "rgba(77,143,255,0.22)");
   poly.setAttribute("stroke", "#2d73d4");
   poly.setAttribute("stroke-width", "2.4");
   svg.appendChild(poly);
-  const keys = ["a", "d", "u"];
+  const keys = ["a", "d", "r"];
   const handles = keys.map((k) => {
     const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
     c.dataset.k = k;
-    c.setAttribute("r", "6");
-    c.setAttribute("fill", "#0f1b2a");
+    c.setAttribute("r", k === "r" ? "9" : "7");
+    c.setAttribute("fill", k === "r" ? "#1a4a7a" : "#0f1b2a");
     svg.appendChild(c);
     return c;
   });
   let active = "";
 
   const redraw = () => {
+    p.s.x = ADSR_S_X;
+    p.u.x = ADSR_U_X;
     p.a.y = Y_PEAK;
     p.d.y = Y_SUST;
     p.u.y = Y_SUST;
     p.s.y = Y_BASE;
     p.r.y = Y_BASE;
+    const gap = 14;
+    const maxAxHalf = p.s.x + (p.u.x - p.s.x) * 0.5 - gap * 0.25;
+    for (let i = 0; i < 4; i += 1) {
+      p.a.x = clamp(p.a.x, p.s.x + gap, Math.min(p.d.x - gap, maxAxHalf));
+      p.d.x = clamp(p.d.x, p.a.x + gap, p.u.x - gap);
+      p.r.x = clamp(p.r.x, p.u.x + gap, ADSR_R_MAX_X);
+    }
+    axis.setAttribute("x2", String(p.r.x));
     poly.setAttribute(
       "d",
       `M ${p.s.x} ${p.s.y} L ${p.a.x} ${p.a.y} L ${p.d.x} ${p.d.y} L ${p.u.x} ${p.u.y} L ${p.r.x} ${p.r.y} L ${p.r.x} ${p.s.y} L ${p.s.x} ${p.s.y} Z`,
     );
     handles.forEach((h) => {
-      h.setAttribute("cx", String(p[h.dataset.k].x));
-      h.setAttribute("cy", String(p[h.dataset.k].y));
+      const key = h.dataset.k;
+      h.setAttribute("cx", String(p[key].x));
+      h.setAttribute("cy", String(p[key].y));
     });
     syncAdsrTimeAxisPxFromShape(p);
-    const D = getAdsrTimelineDurationSec();
-    const span = Math.max(p.r.x - p.s.x, 1e-6);
-    const tA = ((p.a.x - p.s.x) / span) * D;
-    const tD = ((p.d.x - p.s.x) / span) * D;
-    const tU = ((p.u.x - p.s.x) / span) * D;
-    valueEl.textContent = `共${D}s | A:${tA.toFixed(2)}s D:${(tD - tA).toFixed(2)}s S:${(tU - tD).toFixed(2)}s R:${(D - tU).toFixed(2)}s · 频×${ADSR_FREQ_PEAK}/×${ADSR_FREQ_SUSTAIN} · 下次按键生效`;
+    buildAdsrSnapshot();
   };
   svg.addEventListener("mousedown", (e) => {
     const h = e.target.closest("circle");
     if (!h) return;
+    e.preventDefault();
     e.stopPropagation();
     active = h.dataset.k;
   });
-  window.addEventListener("mousemove", (e) => {
+  const onMove = (e) => {
     if (!active) return;
-    const r = svg.getBoundingClientRect();
-    const x = e.clientX - r.left;
+    const x = clientToSvgUserX(svg, e.clientX);
     const gap = 14;
+    const spanAds = Math.max(p.u.x - p.s.x, gap * 3);
+    const maxAxHalf = p.s.x + spanAds * 0.5 - gap * 0.25;
     if (active === "a") {
-      p.a.x = clamp(x, p.s.x + gap, p.d.x - gap);
+      p.a.x = clamp(x, p.s.x + gap, Math.min(p.d.x - gap, maxAxHalf));
     } else if (active === "d") {
       p.d.x = clamp(x, p.a.x + gap, p.u.x - gap);
-    } else if (active === "u") {
-      p.u.x = clamp(x, p.d.x + gap, p.r.x - gap);
+    } else if (active === "r") {
+      p.r.x = clamp(x, p.u.x + gap, ADSR_R_MAX_X);
     }
     redraw();
-  });
-  window.addEventListener("mouseup", () => {
+  };
+  const onUp = () => {
     active = "";
-  });
+  };
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
   redraw();
 }
 
@@ -1169,12 +1391,16 @@ function createNodePanel(type, x, y) {
   panelCounter += 1;
   const prefix = `panel-${id}`;
 
+  const panelW = type === "adsr" ? PANEL_W_ADSR : PANEL_W;
+
   const panel = document.createElement("article");
   panel.className = "node-panel";
+  if (type === "adsr") panel.classList.add("node-panel--adsr");
   panel.dataset.panelId = String(id);
   panel.dataset.nodeType = type;
   panel.style.left = `${x}px`;
   panel.style.top = `${y}px`;
+  panel.style.width = `${panelW}px`;
 
   const header = document.createElement("header");
   header.className = "panel-header";
@@ -1197,7 +1423,11 @@ function createNodePanel(type, x, y) {
 
   const meta = document.createElement("div");
   meta.className = "panel-meta";
-  meta.innerHTML = `<div><b>AudioParam:</b> ${def.audioParam}</div><div><b>物理本质:</b> ${def.physics}</div>`;
+  if (type === "adsr") {
+    meta.style.display = "none";
+  } else {
+    meta.innerHTML = `<div><b>AudioParam:</b> ${def.audioParam}</div><div><b>物理本质:</b> ${def.physics}</div>`;
+  }
 
   panel.append(header, body, meta);
   addPanelPorts(panel, def.colors, prefix);
@@ -1262,6 +1492,23 @@ function wireBubbleDrag() {
       };
       pianoRig.style.transform = "none";
       pianoDragHandle.style.cursor = "grabbing";
+    });
+  }
+
+  if (phonographRig && phonographDragHandle && zone) {
+    phonographDragHandle.addEventListener("mousedown", (e) => {
+      if (isSpacePressed) return;
+      e.preventDefault();
+      const zr = zone.getBoundingClientRect();
+      const br = phonographRig.getBoundingClientRect();
+      didBubbleDrag = false;
+      bubbleDrag = {
+        bubble: phonographRig,
+        start: { x: e.clientX, y: e.clientY },
+        origin: { left: br.left - zr.left, top: br.top - zr.top },
+      };
+      phonographRig.style.transform = "none";
+      phonographDragHandle.style.cursor = "grabbing";
     });
   }
 }
@@ -1331,7 +1578,8 @@ function wireGlobalPointer() {
       const inSidebar = !!e.target.closest(".sidebar");
       if (!inSidebar) {
         const p = worldPointFromClient(e.clientX, e.clientY);
-        createNodePanel(templateDrag.type, p.x - PANEL_W / 2, p.y - PANEL_H / 2);
+        const spawnW = templateDrag.type === "adsr" ? PANEL_W_ADSR : PANEL_W;
+        createNodePanel(templateDrag.type, p.x - spawnW / 2, p.y - PANEL_H / 2);
       }
       templateDrag.ghost.remove();
       templateDrag = null;
@@ -1346,8 +1594,10 @@ function wireGlobalPointer() {
     }
 
     if (bubbleDrag) {
-      const hdr = bubbleDrag.bubble.querySelector(".piano-rig__header");
-      if (hdr) hdr.style.cursor = "grab";
+      const phHdr = bubbleDrag.bubble.querySelector(".phonograph-rig__header");
+      const piHdr = bubbleDrag.bubble.querySelector(".piano-rig__header");
+      if (phHdr) phHdr.style.cursor = "grab";
+      else if (piHdr) piHdr.style.cursor = "grab";
       else bubbleDrag.bubble.style.cursor = "grab";
       bubbleDrag = null;
       return;
@@ -1400,6 +1650,114 @@ function setupWindowEvents() {
   window.addEventListener("resize", renderEdges);
 }
 
+function pickPhonographRecorderMime() {
+  if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) return "";
+  const types = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"];
+  for (const t of types) {
+    if (MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return "";
+}
+
+function stopPhonographRecording() {
+  if (phonographMediaRecorder && phonographMediaRecorder.state === "recording") {
+    phonographMediaRecorder.stop();
+  }
+}
+
+function finalizePhonographRecording() {
+  phonographIsRecording = false;
+  if (phonographRecordBtn) {
+    phonographRecordBtn.classList.remove("is-recording");
+    phonographRecordBtn.setAttribute("aria-pressed", "false");
+  }
+  const blob = new Blob(phonographChunks, { type: phonographChunks[0]?.type || "audio/webm" });
+  phonographChunks = [];
+  if (blob.size < 1) return;
+  phonographLastBlob = blob;
+  if (phonographRecordingUrl) {
+    URL.revokeObjectURL(phonographRecordingUrl);
+    phonographRecordingUrl = null;
+  }
+  phonographRecordingUrl = URL.createObjectURL(blob);
+  if (phonographPlayback) {
+    phonographPlayback.src = phonographRecordingUrl;
+  }
+  if (phonographSaveBtn) phonographSaveBtn.disabled = false;
+}
+
+function startPhonographRecording() {
+  if (!recordStreamDestination) return;
+  const stream = recordStreamDestination.stream;
+  if (!stream?.getAudioTracks?.().length) return;
+  if (typeof MediaRecorder === "undefined") return;
+  phonographPlayback?.pause();
+  const mime = pickPhonographRecorderMime();
+  try {
+    phonographChunks = [];
+    phonographMediaRecorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+  } catch (_e) {
+    phonographMediaRecorder = new MediaRecorder(stream);
+  }
+  phonographMediaRecorder.ondataavailable = (ev) => {
+    if (ev.data?.size) phonographChunks.push(ev.data);
+  };
+  phonographMediaRecorder.onstop = () => {
+    finalizePhonographRecording();
+  };
+  phonographMediaRecorder.start(250);
+  phonographIsRecording = true;
+  if (phonographRecordBtn) {
+    phonographRecordBtn.classList.add("is-recording");
+    phonographRecordBtn.setAttribute("aria-pressed", "true");
+  }
+}
+
+function wirePhonograph() {
+  if (!phonographRecordBtn || !phonographDisc || !phonographPlayback) return;
+
+  phonographRecordBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (phonographIsRecording) {
+      stopPhonographRecording();
+      return;
+    }
+    if (!ensureAudioGraph()) return;
+    if (audioCtx?.state === "suspended") void audioCtx.resume();
+    startPhonographRecording();
+  });
+
+  const playFromStart = () => {
+    if (!phonographLastBlob && !phonographPlayback.src) return;
+    phonographPlayback.currentTime = 0;
+    const p = phonographPlayback.play();
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  };
+
+  phonographDisc.addEventListener("pointerenter", () => {
+    if (phonographIsRecording) return;
+    if (!phonographLastBlob && !phonographPlayback.src) return;
+    playFromStart();
+  });
+  phonographDisc.addEventListener("pointerleave", () => {
+    phonographPlayback.pause();
+  });
+
+  if (phonographSaveBtn) {
+    phonographSaveBtn.addEventListener("click", () => {
+      if (!phonographLastBlob) return;
+      const ext = phonographLastBlob.type.includes("ogg") ? "ogg" : "webm";
+      const url = URL.createObjectURL(phonographLastBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `taste-flow-phonograph-${Date.now()}.${ext}`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    });
+  }
+}
+
 wireMenus();
 decorateTemplateMarkers();
 wireTemplateDrag();
@@ -1408,6 +1766,7 @@ wirePanelDrag();
 wirePortConnect();
 wireGlobalPointer();
 wirePiano();
+wirePhonograph();
 wireCanvasPan();
 setupWindowEvents();
 centerWorld();

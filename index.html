@@ -87,7 +87,7 @@
           <article class="piano-rig" id="pianoRig">
             <header class="piano-rig__header" id="pianoDragHandle">
               <span class="piano-rig__title">钢琴</span>
-              <span class="piano-rig__subtitle">拖标题栏移动 · 鼠标 / 触控 / 键盘 Z 行</span>
+              <span class="piano-rig__subtitle">拖标题栏移动 · 滑音：按住滑过琴键 · 键盘 Z 行 + Q 行（两八度）</span>
             </header>
             <div class="piano-rig__body">
               <div class="piano-keys" id="pianoKeys" role="application" aria-label="钢琴键盘"></div>
@@ -96,6 +96,28 @@
             <button class="port hub-port pink hub-right" data-port="piano-pink" data-color="pink" data-node-kind="audio" type="button" aria-label="粉色端口"></button>
             <button class="port hub-port green hub-left" data-port="piano-green" data-color="green" data-node-kind="audio" type="button" aria-label="绿色端口"></button>
             <button class="port hub-port yellow hub-bottom" data-port="piano-yellow" data-color="yellow" data-node-kind="audio" type="button" aria-label="黄色端口"></button>
+            <span class="rig-attach-anchor rig-attach-anchor--piano" id="pianoAttachAnchor" aria-hidden="true"></span>
+          </article>
+
+          <article class="phonograph-rig" id="phonographRig">
+            <header class="phonograph-rig__header" id="phonographDragHandle">
+              <span class="phonograph-rig__title">留声机</span>
+              <span class="phonograph-rig__subtitle">钢琴附件 · 虚线已自动连接</span>
+            </header>
+            <div class="phonograph-rig__body">
+              <button type="button" class="phonograph-record-btn" id="phonographRecordBtn" title="点击开始/停止录音" aria-pressed="false">
+                <span class="visually-hidden">录音</span>
+              </button>
+              <div class="phonograph-disc-wrap">
+                <div class="phonograph-disc" id="phonographDisc" title="指针悬停在唱片上播放录音">
+                  <span class="phonograph-disc__groove"></span>
+                  <span class="phonograph-disc__label">REC</span>
+                </div>
+              </div>
+              <button type="button" class="phonograph-save-btn" id="phonographSaveBtn" disabled>保存到本地</button>
+            </div>
+            <span class="rig-attach-anchor rig-attach-anchor--phonograph" id="phonographAttachAnchor" aria-hidden="true"></span>
+            <audio id="phonographPlayback" preload="auto"></audio>
           </article>
         </section>
       </div>
